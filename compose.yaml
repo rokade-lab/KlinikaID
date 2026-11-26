@@ -1,0 +1,149 @@
+x-app-build: &app-build
+  context: .
+  dockerfile: docker/php/Dockerfile
+  target: app
+  args:
+    APP_UID: ${KLINIKAID_APP_UID:-10001}
+    APP_GID: ${KLINIKAID_APP_GID:-10001}
+
+x-app-env: &app-env
+  APP_ENV: production
+  DB_HOST: postgres
+  DB_PORT: '5432'
+  DB_NAME: klinikaid
+  STORAGE_ROOT: /var/lib/klinikaid/storage
+  LOG_FILE: /var/log/klinikaid/app.jsonl
+  KLINIKAID_VERSION_FILE: /app/VERSION
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    image: klinikaid-peserta-postgres:${KLINIKAID_IMAGE_TAG:-local}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: klinikaid
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+    secrets:
+    - postgres_password
+    - db_owner_password
+    - db_app_password
+    volumes:
+    - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U postgres -d klinikaid -h 127.0.0.1 -q
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    security_opt:
+    - no-new-privileges:true
+    restart: unless-stopped
+
+  init:
+    image: klinikaid-peserta-app:${KLINIKAID_IMAGE_TAG:-local}
+    pull_policy: never
+    user: '0:0'
+    environment:
+      <<: *app-env
+      DB_USER: klinikaid_owner
+      DB_PASSWORD_FILE: /run/secrets/db_owner_password
+      LAB_ACCOUNTS_FILE: /run/secrets/lab_accounts
+      APP_UID: ${KLINIKAID_APP_UID:-10001}
+      APP_GID: ${KLINIKAID_APP_GID:-10001}
+    secrets:
+    - db_owner_password
+    - lab_accounts
+    volumes:
+    - ./data/storage:/var/lib/klinikaid/storage
+    - ./data/logs:/var/log/klinikaid
+    entrypoint:
+    - sh
+    - -euc
+    - |
+      chown "$$APP_UID:$$APP_GID" /var/lib/klinikaid/storage /var/log/klinikaid
+      chmod 0750 /var/lib/klinikaid/storage
+      php database/bin/migrate.php
+      php database/bin/seed.php
+      chown -R "$$APP_UID:$$APP_GID" /var/lib/klinikaid/storage /var/log/klinikaid
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+    - no-new-privileges:true
+    restart: 'no'
+
+  app:
+    build: *app-build
+    image: klinikaid-peserta-app:${KLINIKAID_IMAGE_TAG:-local}
+    environment:
+      <<: *app-env
+      DB_USER: klinikaid_app
+      DB_PASSWORD_FILE: /run/secrets/db_app_password
+    secrets:
+    - db_app_password
+    volumes:
+    - ./data/storage:/var/lib/klinikaid/storage
+    - ./data/logs:/var/log/klinikaid
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+    - /tmp:size=32m,mode=1777
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - ALL
+    restart: unless-stopped
+
+  proxy:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    image: klinikaid-peserta-proxy:${KLINIKAID_IMAGE_TAG:-local}
+    ports:
+    - 127.0.0.1:${LAB_PORT:-19443}:443
+    - 127.0.0.1:${LAB_HTTP_PORT:-19081}:80
+    environment:
+      KLINIKAID_HTTPS_PORT: ${LAB_PORT:-19443}
+    volumes:
+    - ./data/tls:/etc/nginx/tls
+    depends_on:
+      app:
+        condition: service_healthy
+    cap_drop:
+    - ALL
+    cap_add:
+    - CHOWN
+    - SETUID
+    - SETGID
+    - NET_BIND_SERVICE
+    - DAC_OVERRIDE
+    security_opt:
+    - no-new-privileges:true
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -S -q -O /dev/null -T 2 http://127.0.0.1/ 2>&1 | grep -q ' 301 '
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ./docker/lab-secrets/postgres_password
+  db_owner_password:
+    file: ./docker/lab-secrets/db_owner_password
+  db_app_password:
+    file: ./docker/lab-secrets/db_app_password
+  lab_accounts:
+    file: ./docker/lab-secrets/lab_accounts.json
